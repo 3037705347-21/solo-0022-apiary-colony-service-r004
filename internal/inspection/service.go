@@ -1,7 +1,6 @@
 package inspection
 
 import (
-	"sort"
 	"time"
 
 	"example.com/apiary-colony-service/internal/domain"
@@ -30,6 +29,9 @@ type RecordInput struct {
 	Note           string
 }
 
+// Record 先完成入参校验与关注项派生，再交由仓储在写锁内做状态校验并落盘。
+// 关注项随巡检记录一起固化，蜂场汇总在读取时以每箱最新巡检为准重新推导，
+// 因此被拒绝的请求不会留下任何痕迹，恢复正常的巡检也会立即解除关注。
 func (s *Service) Record(hiveID string, input RecordInput) (domain.Inspection, error) {
 	observedAt := input.ObservedAt
 	if observedAt.IsZero() {
@@ -48,32 +50,7 @@ func (s *Service) Record(hiveID string, input RecordInput) (domain.Inspection, e
 		return domain.Inspection{}, err
 	}
 	record.Concerns = DeriveConcerns(record)
-	s.publishConcerns(hiveID, record.Concerns)
-	saved, err := s.store.AddInspection(hiveID, record)
-	if err != nil {
-		return domain.Inspection{}, err
-	}
-	return saved, nil
-}
-
-// publishConcerns 把这次巡检的关注结果登记到蜂场汇总读取模型。
-func (s *Service) publishConcerns(hiveID string, concerns []string) {
-	if len(concerns) == 0 {
-		return
-	}
-	hive, ok := s.store.GetHive(hiveID)
-	if !ok {
-		return
-	}
-	index := s.store.ApiaryIndex(hive.ApiaryID)
-	for _, existing := range index.ConcernHives {
-		if existing == hiveID {
-			return
-		}
-	}
-	index.ConcernHives = append(index.ConcernHives, hiveID)
-	sort.Strings(index.ConcernHives)
-	s.store.PutApiaryIndex(hive.ApiaryID, index)
+	return s.store.AddInspection(hiveID, record)
 }
 
 func (s *Service) List(hiveID string) ([]domain.Inspection, error) {

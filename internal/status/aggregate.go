@@ -31,7 +31,9 @@ type Report struct {
 	Hives           []HiveSummary  `json:"hives"`
 }
 
-// BuildReport 在单份快照上完成聚合，保证计数与逐蜂箱摘要来自同一视图。
+// BuildReport 在单份快照上完成聚合：状态计数、待巡检集合、关注蜂箱、产卵蜂王
+// 计数与逐蜂箱摘要全部来自同一次遍历，因此同一份汇总内各字段必然互相一致。
+// 关注蜂箱取每箱最新巡检派生的关注项，产卵蜂王数取当前处于 laying 的记录数。
 func BuildReport(snapshot store.Snapshot, apiary domain.Apiary, asOf time.Time) Report {
 	asOf = asOf.UTC()
 	report := Report{
@@ -43,11 +45,9 @@ func BuildReport(snapshot store.Snapshot, apiary domain.Apiary, asOf time.Time) 
 		ConcernHives:    []string{},
 		Hives:           []HiveSummary{},
 	}
-	index := snapshot.ApiaryIndex(apiary.ID)
-	report.LayingQueens = index.LayingQueens
-	report.ConcernHives = append(report.ConcernHives, index.ConcernHives...)
 	hives := snapshot.ApiaryHives(apiary.ID)
 	report.HiveCount = len(hives)
+	layingQueens := 0
 	for _, hive := range hives {
 		report.StateCounts[string(hive.State)]++
 		summary := HiveSummary{
@@ -59,12 +59,15 @@ func BuildReport(snapshot store.Snapshot, apiary domain.Apiary, asOf time.Time) 
 		if queen, ok := snapshot.LayingQueen(hive.ID); ok {
 			summary.QueenID = queen.ID
 			summary.QueenMarkColor = queen.MarkColor
+			layingQueens++
 		}
 		if latest, ok := snapshot.LatestInspection(hive.ID); ok {
 			observedAt := latest.ObservedAt
 			summary.LastInspectionAt = &observedAt
 			if len(latest.Concerns) > 0 {
-				summary.LatestConcerns = append([]string{}, latest.Concerns...)
+				summary.LatestConcerns = append(summary.LatestConcerns, latest.Concerns...)
+				// 与逐箱摘要使用同一份最新巡检，关注集合不会滞后于明细。
+				report.ConcernHives = append(report.ConcernHives, hive.ID)
 			}
 		}
 		if NeedsInspection(hive, asOf) {
@@ -72,6 +75,7 @@ func BuildReport(snapshot store.Snapshot, apiary domain.Apiary, asOf time.Time) 
 		}
 		report.Hives = append(report.Hives, summary)
 	}
+	report.LayingQueens = layingQueens
 	sort.Strings(report.NeedsInspection)
 	sort.Strings(report.ConcernHives)
 	return report

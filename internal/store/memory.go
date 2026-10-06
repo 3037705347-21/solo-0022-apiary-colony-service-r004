@@ -8,8 +8,8 @@ import (
 	"example.com/apiary-colony-service/internal/domain"
 )
 
-// Memory 是并发安全的内存仓储。所有写入都在写锁内完成状态校验，
-// 读取则通过 Snapshot 得到一致视图。
+// Memory 是并发安全的内存仓储。所有写入都在写锁内先完成状态校验再落盘，
+// 校验失败时不改动任何数据；读取则通过 Snapshot 得到一致视图。
 type Memory struct {
 	mu sync.RWMutex
 
@@ -17,7 +17,6 @@ type Memory struct {
 	hives       map[string]domain.Hive
 	inspections map[string][]domain.Inspection
 	queens      map[string][]domain.Queen
-	indexes     map[string]ApiaryIndex
 
 	inspectionSeq int
 	queenSeq      int
@@ -29,7 +28,6 @@ func NewMemory() *Memory {
 		hives:       make(map[string]domain.Hive),
 		inspections: make(map[string][]domain.Inspection),
 		queens:      make(map[string][]domain.Queen),
-		indexes:     make(map[string]ApiaryIndex),
 	}
 }
 
@@ -91,14 +89,18 @@ func (m *Memory) AdvanceHive(hiveID string, target domain.HiveState, _ time.Time
 	return domain.Transition{HiveID: hiveID, From: from, To: target}, nil
 }
 
-// AddInspection 分配巡检编号、写入记录，并推进蜂箱的最近巡检时间。
-// 蜂箱存在与可接受巡检的判定与写入处于同一把锁，避免退役与巡检之间的竞态。
+// AddInspection 先在写锁内确认蜂箱存在且仍接受巡检，再分配编号、写入记录并
+// 推进蜂箱的最近巡检时间。任何校验失败都在第一次写入之前返回，仓储不留痕迹；
+// 锁同时串行化退役与巡检、巡检与巡检，避免并发交错产生丢失或重复。
 func (m *Memory) AddInspection(hiveID string, inspection domain.Inspection) (domain.Inspection, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	hive, ok := m.hives[hiveID]
 	if !ok {
 		return domain.Inspection{}, domain.NotFound("蜂箱", hiveID)
+	}
+	if !hive.AcceptsInspection() {
+		return domain.Inspection{}, domain.InvalidState("蜂箱 %q 处于 %q 状态，不接受巡检", hiveID, hive.State)
 	}
 	m.inspectionSeq++
 	inspection.ID = fmt.Sprintf("inspection-%06d", m.inspectionSeq)
@@ -108,18 +110,16 @@ func (m *Memory) AddInspection(hiveID string, inspection domain.Inspection) (dom
 	observedAt := inspection.ObservedAt
 	hive.LastInspectionAt = &observedAt
 	m.hives[hiveID] = hive
-	if !hive.AcceptsInspection() {
-		return domain.Inspection{}, domain.InvalidState("蜂箱 %q 处于 %q 状态，不接受巡检", hiveID, hive.State)
-	}
 	return inspection, nil
 }
 
-// AddQueen 关闭原有产卵蜂王并写入新蜂王，两件事在同一把锁内完成，
-// 保证任意时刻同一蜂箱至多只有一只 laying 蜂王。
+// AddQueen 在同一把写锁内先确认蜂箱存在且仍接受换王，再关闭当前产卵蜂王、
+// 建立新蜂王并切换蜂箱的当前蜂王。待关闭的蜂王在锁内解析，保证并发换王只有
+// 一个请求能关闭原蜂王，任意时刻同一蜂箱至多只有一只 laying 蜂王。
+// 校验失败时不关闭旧记录、不追加新记录、不动蜂箱，因此被拒绝的请求不留痕迹。
 func (m *Memory) AddQueen(
 	hiveID string,
 	queen domain.Queen,
-	closeQueenID string,
 	closeState domain.QueenState,
 	now time.Time,
 ) (domain.Queen, error) {
@@ -129,9 +129,28 @@ func (m *Memory) AddQueen(
 	if !ok {
 		return domain.Queen{}, domain.NotFound("蜂箱", hiveID)
 	}
-	if closeQueenID != "" {
-		if err := m.closeQueenLocked(hiveID, closeQueenID, closeState, now); err != nil {
-			return domain.Queen{}, err
+	if !hive.AcceptsQueenChange() {
+		return domain.Queen{}, domain.InvalidState("蜂箱 %q 处于 %q 状态，不接受换王", hiveID, hive.State)
+	}
+	if hive.ActiveQueenID != "" {
+		items := m.queens[hiveID]
+		closed := false
+		for index, item := range items {
+			if item.ID != hive.ActiveQueenID {
+				continue
+			}
+			if !item.IsLaying() {
+				return domain.Queen{}, domain.Conflict("蜂王 %q 已经关闭", item.ID)
+			}
+			closedAt := now.UTC()
+			item.State = closeState
+			item.ClosedAt = &closedAt
+			items[index] = item
+			closed = true
+			break
+		}
+		if !closed {
+			return domain.Queen{}, domain.Storage("蜂箱 %q 上的蜂王 %q 记录缺失", hiveID, hive.ActiveQueenID)
 		}
 	}
 	m.queenSeq++
@@ -142,29 +161,7 @@ func (m *Memory) AddQueen(
 
 	hive.ActiveQueenID = queen.ID
 	m.hives[hiveID] = hive
-	if !hive.AcceptsQueenChange() {
-		return domain.Queen{}, domain.InvalidState("蜂箱 %q 处于 %q 状态，不接受换王", hiveID, hive.State)
-	}
 	return queen, nil
-}
-
-func (m *Memory) closeQueenLocked(hiveID, queenID string, state domain.QueenState, now time.Time) error {
-	items := m.queens[hiveID]
-	for index, item := range items {
-		if item.ID != queenID {
-			continue
-		}
-		if !item.IsLaying() {
-			return domain.Conflict("蜂王 %q 已经关闭", queenID)
-		}
-		closedAt := now.UTC()
-		item.State = state
-		item.ClosedAt = &closedAt
-		items[index] = item
-		m.queens[hiveID] = items
-		return nil
-	}
-	return domain.Storage("蜂箱 %q 上的蜂王 %q 记录缺失", hiveID, queenID)
 }
 
 func (m *Memory) ListInspections(hiveID string) ([]domain.Inspection, error) {
@@ -191,24 +188,6 @@ func (m *Memory) ListQueens(hiveID string) ([]domain.Queen, error) {
 	return out, nil
 }
 
-// ApiaryIndex 返回按蜂场维护的汇总读取模型。
-func (m *Memory) ApiaryIndex(apiaryID string) ApiaryIndex {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	index, ok := m.indexes[apiaryID]
-	if !ok {
-		return NewApiaryIndex()
-	}
-	return index.Clone()
-}
-
-// PutApiaryIndex 覆盖按蜂场维护的汇总读取模型。
-func (m *Memory) PutApiaryIndex(apiaryID string, index ApiaryIndex) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.indexes[apiaryID] = index.Clone()
-}
-
 // Snapshot 返回深拷贝的一致视图，供汇总类读取使用。
 func (m *Memory) Snapshot() Snapshot {
 	m.mu.RLock()
@@ -218,7 +197,6 @@ func (m *Memory) Snapshot() Snapshot {
 		Hives:             make(map[string]domain.Hive, len(m.hives)),
 		InspectionsByHive: make(map[string][]domain.Inspection, len(m.inspections)),
 		QueensByHive:      make(map[string][]domain.Queen, len(m.queens)),
-		Indexes:           make(map[string]ApiaryIndex, len(m.indexes)),
 	}
 	for id, apiary := range m.apiaries {
 		snapshot.Apiaries[id] = apiary
@@ -244,9 +222,6 @@ func (m *Memory) Snapshot() Snapshot {
 			}
 		}
 		snapshot.QueensByHive[id] = copied
-	}
-	for id, index := range m.indexes {
-		snapshot.Indexes[id] = index.Clone()
 	}
 	return snapshot
 }

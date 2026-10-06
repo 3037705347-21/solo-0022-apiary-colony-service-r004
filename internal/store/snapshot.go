@@ -6,39 +6,13 @@ import (
 	"example.com/apiary-colony-service/internal/domain"
 )
 
-// ApiaryIndex 是按蜂场维护的汇总读取模型，避免读取汇总时逐箱重算。
-type ApiaryIndex struct {
-	LayingQueens int      `json:"layingQueens"`
-	ConcernHives []string `json:"concernHives"`
-}
-
-func NewApiaryIndex() ApiaryIndex {
-	return ApiaryIndex{ConcernHives: []string{}}
-}
-
-// Clone 复制索引，避免调用方改动共享的关注蜂箱列表。
-func (i ApiaryIndex) Clone() ApiaryIndex {
-	cloned := i
-	cloned.ConcernHives = append([]string{}, i.ConcernHives...)
-	return cloned
-}
-
-// Snapshot 是一次一致性读取的结果，供聚合与校验使用。
+// Snapshot 是一次一致性读取的结果，供聚合与校验使用。汇总的计数、待巡检集合、
+// 关注蜂箱与逐蜂箱摘要全部由这同一份事实推导，不再维护可能漂移的旁路索引。
 type Snapshot struct {
 	Apiaries          map[string]domain.Apiary
 	Hives             map[string]domain.Hive
 	InspectionsByHive map[string][]domain.Inspection
 	QueensByHive      map[string][]domain.Queen
-	Indexes           map[string]ApiaryIndex
-}
-
-// ApiaryIndex 返回快照记录的蜂场汇总读取模型。
-func (s Snapshot) ApiaryIndex(apiaryID string) ApiaryIndex {
-	index, ok := s.Indexes[apiaryID]
-	if !ok {
-		return NewApiaryIndex()
-	}
-	return index.Clone()
 }
 
 // ApiaryHives 返回蜂场下的蜂箱，按编号升序稳定排序。
