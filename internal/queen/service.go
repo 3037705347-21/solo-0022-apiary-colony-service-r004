@@ -33,8 +33,7 @@ type ReplaceInput struct {
 }
 
 func (s *Service) Replace(hiveID string, input ReplaceInput) (domain.Queen, error) {
-	hive, ok := s.store.GetHive(hiveID)
-	if !ok {
+	if _, ok := s.store.GetHive(hiveID); !ok {
 		return domain.Queen{}, domain.NotFound("蜂箱", hiveID)
 	}
 	origin, err := ParseOrigin(input.Origin)
@@ -57,17 +56,8 @@ func (s *Service) Replace(hiveID string, input ReplaceInput) (domain.Queen, erro
 	if reason == ReasonLoss {
 		closeState = domain.QueenLost
 	}
-	if hive.ActiveQueenID == "" {
-		s.publishQueenInstall(hive.ApiaryID)
-	}
-	return s.store.AddQueen(hiveID, record, hive.ActiveQueenID, closeState, s.clock())
-}
-
-// publishQueenInstall 把新建立产卵蜂王计入蜂场汇总读取模型。
-func (s *Service) publishQueenInstall(apiaryID string) {
-	index := s.store.ApiaryIndex(apiaryID)
-	index.LayingQueens++
-	s.store.PutApiaryIndex(apiaryID, index)
+	// 当前产卵蜂王的定位与关闭在仓储写锁内完成，并发换王不会读到过期的 ActiveQueenID。
+	return s.store.AddQueen(hiveID, record, closeState, s.clock())
 }
 
 func (s *Service) List(hiveID string) ([]domain.Queen, error) {

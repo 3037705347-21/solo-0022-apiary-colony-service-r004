@@ -1,7 +1,6 @@
 package inspection
 
 import (
-	"sort"
 	"time"
 
 	"example.com/apiary-colony-service/internal/domain"
@@ -48,32 +47,7 @@ func (s *Service) Record(hiveID string, input RecordInput) (domain.Inspection, e
 		return domain.Inspection{}, err
 	}
 	record.Concerns = DeriveConcerns(record)
-	s.publishConcerns(hiveID, record.Concerns)
-	saved, err := s.store.AddInspection(hiveID, record)
-	if err != nil {
-		return domain.Inspection{}, err
-	}
-	return saved, nil
-}
-
-// publishConcerns 把这次巡检的关注结果登记到蜂场汇总读取模型。
-func (s *Service) publishConcerns(hiveID string, concerns []string) {
-	if len(concerns) == 0 {
-		return
-	}
-	hive, ok := s.store.GetHive(hiveID)
-	if !ok {
-		return
-	}
-	index := s.store.ApiaryIndex(hive.ApiaryID)
-	for _, existing := range index.ConcernHives {
-		if existing == hiveID {
-			return
-		}
-	}
-	index.ConcernHives = append(index.ConcernHives, hiveID)
-	sort.Strings(index.ConcernHives)
-	s.store.PutApiaryIndex(hive.ApiaryID, index)
+	return s.store.AddInspection(hiveID, record)
 }
 
 func (s *Service) List(hiveID string) ([]domain.Inspection, error) {
